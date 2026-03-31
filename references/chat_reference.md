@@ -9,12 +9,15 @@ Use this file when the user expresses todo actions in conversational Chinese or 
 User phrasing:
 
 - `帮我记一个 todo：写周报`
+- `帮我记一下今天要做什么`
+- `帮我记一下明天要做什么`
 - `新增任务，明天做发版检查`
 - `记录一下我要做登录页联调`
 
 Map to:
 
 - `add --title ...`
+- Add `--task-date today` or `--task-date tomorrow` when the user anchors the task to a day
 - Add `--planned-amount` and `--unit` when the user gives an amount such as `3 步`, `2 个模块`, `4 小时`
 - Add `--details` when the user gives extra context
 
@@ -52,39 +55,56 @@ Map to:
 User phrasing:
 
 - `看看还有什么没做`
+- `今天还剩什么没做`
+- `今天的 TODO 是什么`
+- `明天的 TODO 是什么`
+- `明天安排了哪些任务`
 - `列出当前任务`
 - `我现在有哪些 active todo`
 
 Map to:
 
 - `list --status active`
+- Add `--task-date ...` when the user asks about a specific day
 
 ### Show Completed Or Archived Work
 
 User phrasing:
 
 - `看下已经完成的任务`
+- `今天哪些已经完成了`
+- `今天做完了什么`
 - `把归档过的列出来`
 - `我历史任务有哪些`
 
 Map to:
 
-- `list --status completed`
 - `list --status archived`
 - `list --status all`
+
+Because completion auto-archives, day-specific “done” questions usually map to `list --status archived --task-date ...`.
 
 ### Summary
 
 User phrasing:
 
 - `汇总一下现在做了多少`
+- `今天完成了几个任务`
+- `今天还有几个没完成`
 - `看整体进度`
 - `给我一个完成情况统计`
 
 Map to:
 
 - `summary`
+- Add `--task-date ...` when the user asks about a specific day
 - `summary --include-archived` only when the user explicitly wants historical totals
+
+For day-specific routing, use these defaults:
+
+- `今天还剩多少没做` -> `summary --task-date today`
+- `今天完成了多少` -> `summary --task-date today --include-archived`
+- `明天安排了多少任务` -> `summary --task-date tomorrow`
 
 ### Archive
 
@@ -102,7 +122,7 @@ Map to:
 - `archive --title ...`
 - `archive --all-completed`
 
-Archive is explicit. Do not auto-archive immediately after completion unless the user asks.
+Archive is mainly for explicit history management or legacy completed rows. Normal newly completed tasks auto-archive already.
 
 ### Delete
 
@@ -125,4 +145,5 @@ Before deleting, ask for one more explicit confirmation.
 - Prefer exact task ids when the user provides them.
 - Otherwise resolve by exact title match first.
 - If multiple active tasks match the same phrase, ask a narrow follow-up instead of guessing.
-- Keep completed tasks in active views until archive is explicitly requested.
+- Add `--task-date` whenever the user anchors the request to today, tomorrow, yesterday, or an explicit date.
+- Because completion auto-archives, do not expect normal active lists to contain finished tasks.

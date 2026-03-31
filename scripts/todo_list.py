@@ -6,23 +6,25 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 DB_ENV_VAR = "TODO_LIST_DB_PATH"
 DEFAULT_DB_PATH = Path("~/.work_report_summary/todo_list.db").expanduser()
 STATUSES = ("pending", "in_progress", "completed", "archived")
-ACTIVE_STATUSES = ("pending", "in_progress", "completed")
+ACTIVE_STATUSES = ("pending", "in_progress")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
     details TEXT NOT NULL DEFAULT '',
+    task_date TEXT NOT NULL,
     planned_amount REAL NOT NULL CHECK (planned_amount > 0),
     done_amount REAL NOT NULL DEFAULT 0 CHECK (done_amount >= 0),
     unit TEXT NOT NULL DEFAULT 'items',
     status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'archived')),
+    is_done INTEGER NOT NULL DEFAULT 0 CHECK (is_done IN (0, 1)),
     progress_note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -32,6 +34,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status_updated_at
 ON tasks (status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_task_date_status
+ON tasks (task_date, status, updated_at DESC);
 """
 
 
@@ -41,6 +46,25 @@ class TodoError(RuntimeError):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def local_today() -> date:
+    return date.today()
+
+
+def parse_task_date(raw_value: str | None) -> str:
+    value = (raw_value or "today").strip().lower()
+    base_date = local_today()
+    if value == "today":
+        return base_date.isoformat()
+    if value == "tomorrow":
+        return (base_date + timedelta(days=1)).isoformat()
+    if value == "yesterday":
+        return (base_date - timedelta(days=1)).isoformat()
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise TodoError("task_date must be YYYY-MM-DD, today, tomorrow, or yesterday.") from exc
 
 
 def normalize_number(value: Any) -> Any:
@@ -75,6 +99,30 @@ def open_connection(db_path: Path) -> sqlite3.Connection:
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    columns = {
+        row["name"]: row
+        for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+    }
+    if "task_date" not in columns:
+        connection.execute("ALTER TABLE tasks ADD COLUMN task_date TEXT")
+        connection.execute(
+            "UPDATE tasks SET task_date = ? WHERE task_date IS NULL OR task_date = ''",
+            (local_today().isoformat(),),
+        )
+    if "is_done" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN is_done INTEGER NOT NULL DEFAULT 0 CHECK (is_done IN (0, 1))"
+        )
+        connection.execute(
+            """
+            UPDATE tasks
+            SET is_done = CASE
+                WHEN status IN ('completed', 'archived') THEN 1
+                ELSE 0
+            END
+            WHERE is_done IS NULL OR is_done NOT IN (0, 1)
+            """
+        )
 
 
 def status_from_amounts(done_amount: float, planned_amount: float) -> str:
@@ -82,7 +130,7 @@ def status_from_amounts(done_amount: float, planned_amount: float) -> str:
         return "pending"
     if done_amount < planned_amount:
         return "in_progress"
-    return "completed"
+    return "archived"
 
 
 def validate_positive_number(name: str, value: float) -> float:
@@ -108,10 +156,12 @@ def row_to_task(row: sqlite3.Row) -> dict[str, Any]:
     task = dict(row)
     planned_amount = float(task["planned_amount"])
     done_amount = float(task["done_amount"])
+    is_done = bool(task.get("is_done"))
     task["planned_amount"] = normalize_number(planned_amount)
     task["done_amount"] = normalize_number(done_amount)
     task["progress_percent"] = normalize_number((done_amount / planned_amount) * 100 if planned_amount else 0)
-    task["is_completed"] = done_amount >= planned_amount
+    task["is_done"] = is_done
+    task["is_completed"] = is_done
     task["is_archived"] = task["status"] == "archived"
     return task
 
@@ -133,13 +183,22 @@ def resolve_single_task(
     connection: sqlite3.Connection,
     task_id: int | None = None,
     title: str | None = None,
+    task_date: str | None = None,
 ) -> sqlite3.Row:
     if task_id is not None:
         return fetch_task(connection, task_id)
     if title is None:
         raise TodoError("Either task id or title is required.")
 
-    rows = find_tasks_by_title(connection, title)
+    if task_date is None:
+        rows = find_tasks_by_title(connection, title)
+    else:
+        normalized_title = normalize_title(title)
+        normalized_date = parse_task_date(task_date)
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE title = ? AND task_date = ? ORDER BY id ASC",
+            (normalized_title, normalized_date),
+        ).fetchall()
     if not rows:
         raise TodoError(f'Task titled "{normalize_title(title)}" does not exist.')
     if len(rows) > 1:
@@ -215,41 +274,49 @@ def render_text_result(command: str, payload: dict[str, Any]) -> str:
 
 def add_task(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     title = normalize_title(args.title)
+    task_date = parse_task_date(args.task_date)
 
     planned_amount = validate_positive_number("planned_amount", args.planned_amount)
     done_amount = validate_non_negative_number("done_amount", args.done_amount)
     timestamp = utc_now()
     status = status_from_amounts(done_amount, planned_amount)
-    completed_at = timestamp if status == "completed" else None
+    is_done = int(done_amount >= planned_amount)
+    completed_at = timestamp if is_done else None
+    archived_at = timestamp if status == "archived" else None
 
     cursor = connection.execute(
         """
         INSERT INTO tasks (
             title,
             details,
+            task_date,
             planned_amount,
             done_amount,
             unit,
             status,
+            is_done,
             progress_note,
             created_at,
             updated_at,
             completed_at,
             archived_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             title,
             args.details,
+            task_date,
             planned_amount,
             done_amount,
             args.unit,
             status,
+            is_done,
             args.note,
             timestamp,
             timestamp,
             completed_at,
+            archived_at,
         ),
     )
     task = row_to_task(fetch_task(connection, int(cursor.lastrowid)))
@@ -261,15 +328,26 @@ def add_task(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[s
 
 
 def list_tasks(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
+    conditions: list[str] = []
+    params: list[Any] = []
     if args.status == "active":
-        query = "SELECT * FROM tasks WHERE status IN (?, ?, ?) ORDER BY id ASC"
-        params: tuple[Any, ...] = ACTIVE_STATUSES
+        placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
+        conditions.append(f"status IN ({placeholders})")
+        params.extend(ACTIVE_STATUSES)
     elif args.status == "all":
-        query = "SELECT * FROM tasks ORDER BY id ASC"
-        params = ()
+        pass
     else:
-        query = "SELECT * FROM tasks WHERE status = ? ORDER BY id ASC"
-        params = (args.status,)
+        conditions.append("status = ?")
+        params.append(args.status)
+
+    if args.task_date:
+        conditions.append("task_date = ?")
+        params.append(parse_task_date(args.task_date))
+
+    query = "SELECT * FROM tasks"
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY task_date ASC, id ASC"
 
     rows = connection.execute(query, params).fetchall()
     tasks = [row_to_task(row) for row in rows]
@@ -304,11 +382,14 @@ def update_progress(connection: sqlite3.Connection, args: argparse.Namespace) ->
         note = args.note
 
     status = status_from_amounts(done_amount, planned_amount)
+    is_done = int(done_amount >= planned_amount)
     timestamp = utc_now()
-    if status == "completed":
+    if is_done:
         completed_at = completed_at or timestamp
+        archived_at = existing["archived_at"] or timestamp
     else:
         completed_at = None
+        archived_at = None
 
     connection.execute(
         """
@@ -316,12 +397,14 @@ def update_progress(connection: sqlite3.Connection, args: argparse.Namespace) ->
         SET planned_amount = ?,
             done_amount = ?,
             status = ?,
+            is_done = ?,
             progress_note = ?,
             updated_at = ?,
-            completed_at = ?
+            completed_at = ?,
+            archived_at = ?
         WHERE id = ?
         """,
-        (planned_amount, done_amount, status, note, timestamp, completed_at, args.id),
+        (planned_amount, done_amount, status, is_done, note, timestamp, completed_at, archived_at, args.id),
     )
     task = row_to_task(fetch_task(connection, args.id))
     return {
@@ -345,17 +428,19 @@ def complete_task(connection: sqlite3.Connection, args: argparse.Namespace) -> d
         """
         UPDATE tasks
         SET done_amount = ?,
-            status = 'completed',
+            status = 'archived',
+            is_done = 1,
             updated_at = ?,
-            completed_at = ?
+            completed_at = ?,
+            archived_at = ?
         WHERE id = ?
         """,
-        (done_amount, timestamp, completed_at, args.id),
+        (done_amount, timestamp, completed_at, timestamp, args.id),
     )
     task = row_to_task(fetch_task(connection, args.id))
     return {
         "db_path": str(resolve_db_path(args.db_path)),
-        "message": "Marked task complete.",
+        "message": "Marked task complete and archived it.",
         "task": task,
     }
 
@@ -392,7 +477,7 @@ def archive_task(connection: sqlite3.Connection, args: argparse.Namespace) -> di
             "tasks": tasks,
         }
 
-    existing = resolve_single_task(connection, args.id, args.title)
+    existing = resolve_single_task(connection, args.id, args.title, args.task_date)
     existing_id = int(existing["id"])
     if existing["status"] == "archived":
         task = row_to_task(existing)
@@ -401,6 +486,8 @@ def archive_task(connection: sqlite3.Connection, args: argparse.Namespace) -> di
             "message": "Task was already archived.",
             "task": task,
         }
+    if not bool(existing["is_done"]):
+        raise TodoError("Only completed tasks can be archived.")
 
     timestamp = utc_now()
     connection.execute(
@@ -425,7 +512,7 @@ def delete_task(connection: sqlite3.Connection, args: argparse.Namespace) -> dic
     if not args.confirm:
         raise TodoError("delete requires --confirm because deletion is permanent.")
 
-    existing = resolve_single_task(connection, args.id, args.title)
+    existing = resolve_single_task(connection, args.id, args.title, args.task_date)
     task = row_to_task(existing)
     connection.execute("DELETE FROM tasks WHERE id = ?", (existing["id"],))
     task["deleted"] = True
@@ -438,20 +525,33 @@ def delete_task(connection: sqlite3.Connection, args: argparse.Namespace) -> dic
 
 def summarize_tasks(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     counts = {status: 0 for status in STATUSES}
-    for row in connection.execute("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status").fetchall():
+    count_query = "SELECT status, COUNT(*) AS count FROM tasks"
+    count_params: list[Any] = []
+    if args.task_date:
+        count_query += " WHERE task_date = ?"
+        count_params.append(parse_task_date(args.task_date))
+    count_query += " GROUP BY status"
+    for row in connection.execute(count_query, count_params).fetchall():
         counts[row["status"]] = int(row["count"])
 
+    conditions: list[str] = []
+    params: list[Any] = []
     if args.include_archived:
-        totals_row = connection.execute(
-            "SELECT COALESCE(SUM(planned_amount), 0) AS planned_amount, COALESCE(SUM(done_amount), 0) AS done_amount FROM tasks"
-        ).fetchone()
         scope = "all"
     else:
-        totals_row = connection.execute(
-            "SELECT COALESCE(SUM(planned_amount), 0) AS planned_amount, COALESCE(SUM(done_amount), 0) AS done_amount FROM tasks WHERE status IN (?, ?, ?)",
-            ACTIVE_STATUSES,
-        ).fetchone()
+        placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
+        conditions.append(f"status IN ({placeholders})")
+        params.extend(ACTIVE_STATUSES)
         scope = "active"
+
+    if args.task_date:
+        conditions.append("task_date = ?")
+        params.append(parse_task_date(args.task_date))
+
+    totals_query = "SELECT COALESCE(SUM(planned_amount), 0) AS planned_amount, COALESCE(SUM(done_amount), 0) AS done_amount FROM tasks"
+    if conditions:
+        totals_query += " WHERE " + " AND ".join(conditions)
+    totals_row = connection.execute(totals_query, params).fetchone()
 
     planned_amount = float(totals_row["planned_amount"])
     done_amount = float(totals_row["done_amount"])
@@ -478,6 +578,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser = subparsers.add_parser("add", help="Create a new task.")
     add_parser.add_argument("--title", required=True, help="Task title.")
     add_parser.add_argument("--details", default="", help="Longer task description.")
+    add_parser.add_argument("--task-date", default="today", help="Task date: YYYY-MM-DD, today, tomorrow, or yesterday.")
     add_parser.add_argument("--planned-amount", type=float, default=1.0, help="Target amount of work.")
     add_parser.add_argument("--done-amount", type=float, default=0.0, help="Completed amount at creation time.")
     add_parser.add_argument("--unit", default="items", help="Unit label for planned and done amounts.")
@@ -490,6 +591,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="active",
         help="Which tasks to show.",
     )
+    list_parser.add_argument("--task-date", help="Filter by task date: YYYY-MM-DD, today, tomorrow, or yesterday.")
 
     progress_parser = subparsers.add_parser("progress", help="Update task progress.")
     progress_parser.add_argument("--id", type=int, required=True, help="Task id.")
@@ -506,14 +608,17 @@ def build_parser() -> argparse.ArgumentParser:
     archive_selector.add_argument("--id", type=int, help="Task id.")
     archive_selector.add_argument("--title", help="Exact task title.")
     archive_selector.add_argument("--all-completed", action="store_true", help="Archive all completed tasks.")
+    archive_parser.add_argument("--task-date", help="Filter title match by task date: YYYY-MM-DD, today, tomorrow, or yesterday.")
 
     delete_parser = subparsers.add_parser("delete", help="Delete a task permanently.")
     delete_selector = delete_parser.add_mutually_exclusive_group(required=True)
     delete_selector.add_argument("--id", type=int, help="Task id.")
     delete_selector.add_argument("--title", help="Exact task title.")
+    delete_parser.add_argument("--task-date", help="Filter title match by task date: YYYY-MM-DD, today, tomorrow, or yesterday.")
     delete_parser.add_argument("--confirm", action="store_true", help="Confirm permanent deletion.")
 
     summary_parser = subparsers.add_parser("summary", help="Summarize current totals.")
+    summary_parser.add_argument("--task-date", help="Filter by task date: YYYY-MM-DD, today, tomorrow, or yesterday.")
     summary_parser.add_argument("--include-archived", action="store_true", help="Include archived tasks in totals.")
 
     return parser

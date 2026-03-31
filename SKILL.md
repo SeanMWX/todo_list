@@ -1,6 +1,6 @@
 ---
 name: todo_list
-description: Track local todo or work-report items in a SQLite database, including planned work, progress amounts, completion status, deletion, and archiving. Use when Codex needs to add tasks, delete tasks, update progress, list current work, mark work complete, summarize progress, or archive finished or cancelled items for a user.
+description: Track local todo or work-report items in a SQLite database, including task dates, explicit completion state, progress amounts, deletion, and archiving. Use when Codex needs to add dated tasks, check today's or tomorrow's todos, delete tasks, update progress, list current work by day, mark work complete, summarize progress, or inspect archived completions for a user.
 ---
 
 # todo_list
@@ -13,7 +13,9 @@ Use this skill to persist local work items instead of keeping them only in chat 
 - Store data in `~/.work_report_summary/todo_list.db` by default.
 - Override the database path with `TODO_LIST_DB_PATH` only for tests or when the user explicitly wants a different file.
 - Prefer `--json` whenever the command output will be used in a follow-up step.
-- Keep completed items visible in active lists until the user asks to archive them.
+- Store every task with a `task_date` so today's and tomorrow's todos stay separate.
+- Store an explicit `is_done` field. Do not infer completion from chat history alone.
+- Auto-archive a task when it becomes complete. Incomplete tasks must stay unarchived.
 - Treat archived items as terminal history. Do not update their progress after archiving.
 - Use `delete` only when the user explicitly wants permanent removal. Prefer `archive` when the user means "move to history".
 - Before running `delete`, ask for one more explicit confirmation from the user. Permanent deletion should be confirmed, not inferred.
@@ -24,6 +26,7 @@ Map common user requests to the deterministic CLI instead of keeping task state 
 
 - Add planned work when the user says things like:
   `帮我记一下今天要做周报`
+  `帮我记一下明天要做什么`
   `新增一个任务：整理 demo，计划 3 步`
   `记个 todo：修登录页 bug`
 - Update progress when the user says things like:
@@ -36,10 +39,16 @@ Map common user requests to the deterministic CLI instead of keeping task state 
   `周报已经完成`
 - List or review current work when the user says things like:
   `看看我现在还有什么没做`
+  `今天还剩什么没做`
+  `今天的 TODO 是什么`
+  `明天的 TODO 是什么`
+  `明天安排了哪些任务`
   `列出今天的 todo`
-  `我有哪些已经完成但还没归档的任务`
+  `今天哪些做完了`
 - Summarize when the user says things like:
   `汇总一下我今天做了多少`
+  `今天完成了几个任务`
+  `今天还有几个没完成`
   `看下整体进度`
   `给我一个当前完成情况`
 - Archive only when the user explicitly asks to archive or move finished work into history:
@@ -53,16 +62,28 @@ Map common user requests to the deterministic CLI instead of keeping task state 
 
 When the user does not specify an exact task id, identify the task by title or recent context first, then run the CLI with the resolved id.
 
+## Day Routing
+
+- For `今天还剩什么` or `今天未完成的有哪些`, use `list --status active --task-date today`.
+- For `明天要做什么` or `明天安排了什么`, use `list --status all --task-date tomorrow`.
+- For `今天做完了什么`, use `list --status archived --task-date today`.
+- For `今天完成了多少` or `今天整体完成情况`, use `summary --task-date today --include-archived`.
+- For `今天还有多少没完成`, use `summary --task-date today`.
+- If the user asks about a specific absolute day such as `2026-04-01`, pass that exact date through `--task-date`.
+- Because completion auto-archives, do not look for a normal steady-state bucket of `completed but not archived` tasks.
+
 ## Core Commands
 
 - Add a task:
-  `python {baseDir}/scripts/todo_list.py --json add --title "Prepare weekly report" --planned-amount 3 --unit sections --details "Collect wins and blockers"`
+  `python {baseDir}/scripts/todo_list.py --json add --title "Prepare weekly report" --task-date today --planned-amount 3 --unit sections --details "Collect wins and blockers"`
 - Record progress:
   `python {baseDir}/scripts/todo_list.py --json progress --id 1 --increment 1 --note "Finished the metrics section"`
 - Mark a task complete:
   `python {baseDir}/scripts/todo_list.py --json complete --id 1`
 - List active tasks:
-  `python {baseDir}/scripts/todo_list.py --json list --status active`
+  `python {baseDir}/scripts/todo_list.py --json list --status active --task-date today`
+- List all tasks for tomorrow:
+  `python {baseDir}/scripts/todo_list.py --json list --status all --task-date tomorrow`
 - Archive a task:
   `python {baseDir}/scripts/todo_list.py --json archive --id 1`
 - Archive by exact title:
@@ -74,7 +95,7 @@ When the user does not specify an exact task id, identify the task by title or r
 - Delete by exact title:
   `python {baseDir}/scripts/todo_list.py --json delete --title "Prepare weekly report" --confirm`
 - Summarize progress:
-  `python {baseDir}/scripts/todo_list.py --json summary`
+  `python {baseDir}/scripts/todo_list.py --json summary --task-date today`
 
 ## References
 
