@@ -93,12 +93,32 @@ User phrasing:
 - `把这个归档`
 - `归档第 4 个任务`
 - `把做完的移到历史`
+- `把“周报”这个任务归档`
+- `把已完成任务都归档`
 
 Map to:
 
 - `archive --id ...`
+- `archive --title ...`
+- `archive --all-completed`
 
 Archive is explicit. Do not auto-archive immediately after completion unless the user asks.
+
+### Delete
+
+User phrasing:
+
+- `把这个任务删掉`
+- `删除第 3 个任务`
+- `这个 todo 不要了，永久删除`
+
+Map to:
+
+- `delete --id ... --confirm`
+- `delete --title ... --confirm`
+
+Delete is permanent. Prefer `archive` when the user says `归档`, `移到历史`, or otherwise implies retention.
+Before deleting, ask for one more explicit confirmation.
 
 ## Resolution Rules
 

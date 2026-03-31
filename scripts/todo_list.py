@@ -97,6 +97,13 @@ def validate_non_negative_number(name: str, value: float) -> float:
     return value
 
 
+def normalize_title(title: str) -> str:
+    normalized = title.strip()
+    if not normalized:
+        raise TodoError("title must not be empty.")
+    return normalized
+
+
 def row_to_task(row: sqlite3.Row) -> dict[str, Any]:
     task = dict(row)
     planned_amount = float(task["planned_amount"])
@@ -114,6 +121,39 @@ def fetch_task(connection: sqlite3.Connection, task_id: int) -> sqlite3.Row:
     if row is None:
         raise TodoError(f"Task #{task_id} does not exist.")
     return row
+
+
+def find_tasks_by_title(connection: sqlite3.Connection, title: str) -> list[sqlite3.Row]:
+    normalized_title = normalize_title(title)
+    rows = connection.execute("SELECT * FROM tasks WHERE title = ? ORDER BY id ASC", (normalized_title,)).fetchall()
+    return list(rows)
+
+
+def resolve_single_task(
+    connection: sqlite3.Connection,
+    task_id: int | None = None,
+    title: str | None = None,
+) -> sqlite3.Row:
+    if task_id is not None:
+        return fetch_task(connection, task_id)
+    if title is None:
+        raise TodoError("Either task id or title is required.")
+
+    rows = find_tasks_by_title(connection, title)
+    if not rows:
+        raise TodoError(f'Task titled "{normalize_title(title)}" does not exist.')
+    if len(rows) > 1:
+        raise TodoError(f'Multiple tasks match title "{normalize_title(title)}". Use --id instead.')
+    return rows[0]
+
+
+def fetch_tasks_by_ids(connection: sqlite3.Connection, task_ids: list[int]) -> list[sqlite3.Row]:
+    if not task_ids:
+        return []
+    placeholders = ", ".join("?" for _ in task_ids)
+    query = f"SELECT * FROM tasks WHERE id IN ({placeholders}) ORDER BY id ASC"
+    rows = connection.execute(query, task_ids).fetchall()
+    return list(rows)
 
 
 def json_output(payload: dict[str, Any]) -> str:
@@ -138,6 +178,12 @@ def render_text_result(command: str, payload: dict[str, Any]) -> str:
                 f"DB: {payload['db_path']}",
             ]
         )
+
+    if command == "archive" and "tasks" in payload:
+        lines = [payload.get("message", "Archived tasks."), f"Count: {payload['archived_count']}"]
+        lines.extend(render_task_line(task) for task in payload["tasks"])
+        lines.append(f"DB: {payload['db_path']}")
+        return "\n".join(lines)
 
     if command == "list":
         lines = [f"Tasks ({payload['status_filter']}): {payload['count']}"]
@@ -168,9 +214,7 @@ def render_text_result(command: str, payload: dict[str, Any]) -> str:
 
 
 def add_task(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
-    title = args.title.strip()
-    if not title:
-        raise TodoError("title must not be empty.")
+    title = normalize_title(args.title)
 
     planned_amount = validate_positive_number("planned_amount", args.planned_amount)
     done_amount = validate_non_negative_number("done_amount", args.done_amount)
@@ -317,7 +361,39 @@ def complete_task(connection: sqlite3.Connection, args: argparse.Namespace) -> d
 
 
 def archive_task(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
-    existing = fetch_task(connection, args.id)
+    if args.all_completed:
+        rows = connection.execute("SELECT * FROM tasks WHERE status = 'completed' ORDER BY id ASC").fetchall()
+        if not rows:
+            return {
+                "archived_count": 0,
+                "db_path": str(resolve_db_path(args.db_path)),
+                "message": "No completed tasks to archive.",
+                "tasks": [],
+            }
+
+        task_ids = [int(row["id"]) for row in rows]
+        timestamp = utc_now()
+        placeholders = ", ".join("?" for _ in task_ids)
+        connection.execute(
+            f"""
+            UPDATE tasks
+            SET status = 'archived',
+                updated_at = ?,
+                archived_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            [timestamp, timestamp, *task_ids],
+        )
+        tasks = [row_to_task(row) for row in fetch_tasks_by_ids(connection, task_ids)]
+        return {
+            "archived_count": len(tasks),
+            "db_path": str(resolve_db_path(args.db_path)),
+            "message": f"Archived {len(tasks)} completed task(s).",
+            "tasks": tasks,
+        }
+
+    existing = resolve_single_task(connection, args.id, args.title)
+    existing_id = int(existing["id"])
     if existing["status"] == "archived":
         task = row_to_task(existing)
         return {
@@ -335,12 +411,27 @@ def archive_task(connection: sqlite3.Connection, args: argparse.Namespace) -> di
             archived_at = ?
         WHERE id = ?
         """,
-        (timestamp, timestamp, args.id),
+        (timestamp, timestamp, existing_id),
     )
-    task = row_to_task(fetch_task(connection, args.id))
+    task = row_to_task(fetch_task(connection, existing_id))
     return {
         "db_path": str(resolve_db_path(args.db_path)),
         "message": "Archived task.",
+        "task": task,
+    }
+
+
+def delete_task(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
+    if not args.confirm:
+        raise TodoError("delete requires --confirm because deletion is permanent.")
+
+    existing = resolve_single_task(connection, args.id, args.title)
+    task = row_to_task(existing)
+    connection.execute("DELETE FROM tasks WHERE id = ?", (existing["id"],))
+    task["deleted"] = True
+    return {
+        "db_path": str(resolve_db_path(args.db_path)),
+        "message": "Deleted task.",
         "task": task,
     }
 
@@ -411,7 +502,16 @@ def build_parser() -> argparse.ArgumentParser:
     complete_parser.add_argument("--id", type=int, required=True, help="Task id.")
 
     archive_parser = subparsers.add_parser("archive", help="Archive a task.")
-    archive_parser.add_argument("--id", type=int, required=True, help="Task id.")
+    archive_selector = archive_parser.add_mutually_exclusive_group(required=True)
+    archive_selector.add_argument("--id", type=int, help="Task id.")
+    archive_selector.add_argument("--title", help="Exact task title.")
+    archive_selector.add_argument("--all-completed", action="store_true", help="Archive all completed tasks.")
+
+    delete_parser = subparsers.add_parser("delete", help="Delete a task permanently.")
+    delete_selector = delete_parser.add_mutually_exclusive_group(required=True)
+    delete_selector.add_argument("--id", type=int, help="Task id.")
+    delete_selector.add_argument("--title", help="Exact task title.")
+    delete_parser.add_argument("--confirm", action="store_true", help="Confirm permanent deletion.")
 
     summary_parser = subparsers.add_parser("summary", help="Summarize current totals.")
     summary_parser.add_argument("--include-archived", action="store_true", help="Include archived tasks in totals.")
@@ -434,6 +534,8 @@ def run_command(args: argparse.Namespace) -> dict[str, Any]:
                 payload = complete_task(connection, args)
             elif args.command == "archive":
                 payload = archive_task(connection, args)
+            elif args.command == "delete":
+                payload = delete_task(connection, args)
             elif args.command == "summary":
                 payload = summarize_tasks(connection, args)
             else:

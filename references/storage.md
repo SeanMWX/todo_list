@@ -28,6 +28,7 @@ The runtime stores tasks in a single `tasks` table with these fields:
 - Infer `completed` when `done_amount >= planned_amount`.
 - Preserve completed tasks in active views until explicit archive.
 - Reject progress updates after archive so archived tasks stay historical.
+- Permanent deletion removes the row entirely from SQLite and from all future list and summary results.
 
 ## Test Isolation
 

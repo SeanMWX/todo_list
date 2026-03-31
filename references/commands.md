@@ -57,7 +57,32 @@ Move a task into historical storage.
 
 ```bash
 python {baseDir}/scripts/todo_list.py --json archive --id 1
+python {baseDir}/scripts/todo_list.py --json archive --title "Write sprint summary"
+python {baseDir}/scripts/todo_list.py --json archive --all-completed
 ```
+
+Rules:
+
+- Use `--title` only for an exact title match.
+- If multiple tasks share the same title, fall back to `--id`.
+- `--all-completed` archives every task currently in `completed` state.
+
+### Delete
+
+Delete a task permanently from the SQLite database.
+
+```bash
+python {baseDir}/scripts/todo_list.py --json delete --id 1 --confirm
+python {baseDir}/scripts/todo_list.py --json delete --title "Write sprint summary" --confirm
+```
+
+Rules:
+
+- Use this only for explicit permanent removal.
+- Prefer `archive` when the user wants historical retention.
+- Require a second confirmation before using it.
+- The CLI enforces this with `--confirm`.
+- A deleted task no longer appears in `list` or `summary`.
 
 ### Summary
 
@@ -74,5 +99,6 @@ python {baseDir}/scripts/todo_list.py --json summary --include-archived
 python {baseDir}/scripts/todo_list.py --json add --title "Prepare demo" --planned-amount 3 --unit steps
 python {baseDir}/scripts/todo_list.py --json progress --id 1 --increment 2 --note "Slides and notes ready"
 python {baseDir}/scripts/todo_list.py --json complete --id 1
-python {baseDir}/scripts/todo_list.py --json archive --id 1
+python {baseDir}/scripts/todo_list.py --json archive --all-completed
+python {baseDir}/scripts/todo_list.py --json delete --id 2 --confirm
 ```
