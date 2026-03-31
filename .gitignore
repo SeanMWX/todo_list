@@ -1,0 +1,12 @@
+skill_creator/
+test/
+__pycache__/
+*.py[cod]
+*.skill
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
